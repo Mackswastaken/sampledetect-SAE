@@ -1,0 +1,11 @@
+﻿fastapi
+uvicorn[standard]
+python-multipart
+sqlalchemy
+psycopg2-binary
+python-dotenv
+rapidfuzz
+sendgrid
+web3
+supabase
+httpx
