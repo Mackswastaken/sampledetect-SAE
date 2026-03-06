@@ -12,3 +12,5 @@ backend/.venv/
 # Node
 frontend/node_modules/
 chain/node_modules/
+
+SUBMISSION_EXPORT/
