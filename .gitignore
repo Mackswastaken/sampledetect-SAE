@@ -1,0 +1,14 @@
+# Secrets
+**/.env
+**/.env.*
+!.env.example
+!.env.local.example
+
+# Python
+**/__pycache__/
+**/*.pyc
+backend/.venv/
+
+# Node
+frontend/node_modules/
+chain/node_modules/
