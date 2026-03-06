@@ -20,7 +20,30 @@ from sqlalchemy.orm import Session
 # Project imports (your existing files)
 # ---------------------------------------------------------------------
 from db import Base, engine, get_db
-from models import AudioAsset, LibraryAudio, MonitorIncident, ProofRecord
+import models as models_mod
+
+def _pick_model(*names: str):
+    for n in names:
+        if hasattr(models_mod, n):
+            return getattr(models_mod, n)
+    raise ImportError(f"None of these model names exist in models.py: {names}")
+
+# Required
+AudioAsset = _pick_model("AudioAsset", "Asset", "AudioFile")
+
+# Library table (this is the one failing)
+LibraryAudio = _pick_model(
+    "LibraryAudio",
+    "LibraryTrack",
+    "LibraryBeat",
+    "LibraryItem",
+    "LibraryFile",
+    "AudioLibrary",
+)
+
+# Monitor + Proof tables
+MonitorIncident = _pick_model("MonitorIncident", "Incident", "MonitorEvent")
+ProofRecord = _pick_model("ProofRecord", "Proof", "BlockchainProof", "ProofEntry")
 from settings import (
     DATABASE_URL,
     STORAGE_MODE,
