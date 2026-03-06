@@ -1,29 +1,36 @@
 import os
 import sys
-import re
 import json
 import uuid
-import hashlib
+import base64
 import shutil
+import hashlib
 import tempfile
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 from dotenv import load_dotenv
-load_dotenv()
 
-# ---------- OPTIONAL imports (only used if available in env) ----------
-try:
-    from rapidfuzz import fuzz
-except Exception:
-    fuzz = None
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    Integer,
+    Float,
+    DateTime,
+    Text,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base
 
+# ----------------------------
+# Optional deps (only used if configured)
+# ----------------------------
 try:
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
@@ -36,110 +43,204 @@ try:
 except Exception:
     Web3 = None
 
-# Supabase storage wrapper (created earlier)
-# storage_supabase.py must exist
 try:
-    from storage_supabase import SupabaseStorage
+    from supabase import create_client as create_supabase_client
 except Exception:
-    SupabaseStorage = None
+    create_supabase_client = None
+
+# Spectrogram deps
+try:
+    import numpy as np  # type: ignore
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # type: ignore
+    from scipy.io import wavfile  # type: ignore
+except Exception:
+    np = None
+    plt = None
+    wavfile = None
 
 
-# =========================
-# Config / Settings
-# =========================
+load_dotenv()
 
-def env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v is not None and v != "" else default
+# ----------------------------
+# App
+# ----------------------------
+app = FastAPI(title="SampleDetect SAE API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # MVP
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-STORAGE_MODE = env("STORAGE_MODE", "local").lower()  # local | supabase
-STORAGE_ROOT = Path(env("STORAGE_ROOT", "./storage")).resolve()
-
-DATABASE_URL = env("DATABASE_URL")  # required
+# ----------------------------
+# ENV / SETTINGS
+# ----------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing in .env / environment variables")
 
-# Supabase storage (only used if STORAGE_MODE=supabase)
-SUPABASE_BUCKET = env("SUPABASE_BUCKET", "sampledetect")
+STORAGE_MODE = os.getenv("STORAGE_MODE", "local").lower()  # local | supabase
+STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "./storage")).resolve()
 
-# Audfprint paths (local)
-AUDFPRINT_PKLZ_LOCAL = STORAGE_ROOT / "audfprint" / "library.pklz"
-AUDFPRINT_FILES_TXT_LOCAL = STORAGE_ROOT / "audfprint" / "library_files.txt"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "sampledetect")
 
-# Directory layout (local)
+# Email
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_TO = os.getenv("EMAIL_TO", "")
+
+# Blockchain
+AMOY_RPC_URL = os.getenv("AMOY_RPC_URL", "")
+AMOY_PRIVATE_KEY = os.getenv("AMOY_PRIVATE_KEY", "")
+PROOF_REGISTRY_ADDRESS = os.getenv("PROOF_REGISTRY_ADDRESS", "")
+
+# Audfprint vendored path (CRITICAL for Render)
+AUDPRINT_PY = str((Path(__file__).parent / "vendor" / "audfprint" / "audfprint.py").resolve())
+
+# ----------------------------
+# Local storage layout (only used when STORAGE_MODE=local)
+# ----------------------------
 UPLOADS_DIR = STORAGE_ROOT / "uploads"
 FINGERPRINTS_DIR = STORAGE_ROOT / "fingerprints"
-SPECTROGRAMS_DIR = STORAGE_ROOT / "spectrograms"
 TEMP_DIR = STORAGE_ROOT / "temp"
-LOGS_DIR = STORAGE_ROOT / "logs"
 EXPORTS_DIR = STORAGE_ROOT / "exports"
+LOGS_DIR = STORAGE_ROOT / "logs"
+
 LIBRARY_AUDIO_DIR = STORAGE_ROOT / "library_audio"
 LIBRARY_FINGERPRINTS_DIR = STORAGE_ROOT / "library_fingerprints"
+
 MONITOR_INBOX_DIR = STORAGE_ROOT / "monitor_inbox"
-MONITOR_PROCESSED_DIR = STORAGE_ROOT / "monitor_processed"
-AUDFPRINT_DIR = STORAGE_ROOT / "audfprint"
 
-# External tool paths
-FFMPEG = env("FFMPEG_BIN", "ffmpeg")  # assumes ffmpeg is in PATH
-PYTHON_EXE = env("PYTHON_EXE", None)  # optional override
-
-# audfprint source path (local dev)
-# You previously used:
-# C:\Projects\sampledetect-mvp\backend\.venv\Scripts\python.exe C:\Projects\audfprint\audfprint\audfprint.py ...
-AUDFPRINT_PY = env("AUDFPRINT_PY", r"C:\Projects\audfprint\audfprint\audfprint.py")
+# Local audfprint output location (on Render we prefer /tmp, but this is fine locally)
+AUDPRINT_DIR = STORAGE_ROOT / "audfprint"
+AUDPRINT_DB = AUDPRINT_DIR / "library.pklz"
+AUDPRINT_FILES_TXT = AUDPRINT_DIR / "library_files.txt"
 
 
 def ensure_local_dirs():
     for p in [
         UPLOADS_DIR,
         FINGERPRINTS_DIR,
-        SPECTROGRAMS_DIR,
         TEMP_DIR,
-        LOGS_DIR,
         EXPORTS_DIR,
+        LOGS_DIR,
         LIBRARY_AUDIO_DIR,
         LIBRARY_FINGERPRINTS_DIR,
         MONITOR_INBOX_DIR,
-        MONITOR_PROCESSED_DIR,
-        AUDFPRINT_DIR,
+        AUDPRINT_DIR,
     ]:
         p.mkdir(parents=True, exist_ok=True)
 
 
-def get_mode() -> str:
-    return env("STORAGE_MODE", STORAGE_MODE).lower()
+# ----------------------------
+# Supabase helpers
+# ----------------------------
+def supabase():
+    if STORAGE_MODE != "supabase":
+        return None
+    if not create_supabase_client:
+        raise RuntimeError("supabase-py not installed. Install supabase in requirements.txt.")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing")
+    return create_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-def get_sb() -> "SupabaseStorage":
-    if SupabaseStorage is None:
-        raise RuntimeError("SupabaseStorage not available. Ensure storage_supabase.py + requirements are installed.")
-    return SupabaseStorage()
+def sb_upload_bytes(path_key: str, data: bytes, content_type: str = "application/octet-stream"):
+    sb = supabase()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
+    # upsert=True overwrites if exists
+    res = sb.storage.from_(SUPABASE_BUCKET).upload(
+        path=path_key,
+        file=data,
+        file_options={"content-type": content_type, "upsert": "true"},
+    )
+    return res
 
 
-def sb_key(*parts: str) -> str:
-    return "/".join([p.strip("/").replace("\\", "/") for p in parts if p is not None])
+def sb_download_bytes(path_key: str) -> bytes:
+    sb = supabase()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
+    data = sb.storage.from_(SUPABASE_BUCKET).download(path_key)
+    # supabase-py returns bytes
+    return data
 
 
-# =========================
-# Database (SQLAlchemy)
-# =========================
-from sqlalchemy import create_engine, Column, String, DateTime, Integer, Text
-from sqlalchemy.orm import sessionmaker, declarative_base
+def sb_list(prefix: str) -> List[Dict[str, Any]]:
+    sb = supabase()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
 
-Base = declarative_base()
+    # Supabase uses "folder" + "search"
+    # We implement a simple recursive listing by splitting prefix.
+    folder = prefix.strip("/")
+
+    if "/" in folder:
+        parent, child = folder.rsplit("/", 1)
+    else:
+        parent, child = "", folder
+
+    # If prefix points to a folder itself:
+    base_path = folder if folder else ""
+    # list() expects folder path, not prefix wildcard
+    items = sb.storage.from_(SUPABASE_BUCKET).list(path=base_path)
+    # items include files in that folder
+    return items
+
+
+def sb_recursive_collect(prefix: str) -> List[str]:
+    """
+    Recursively collect full object keys under a prefix.
+    """
+    sb = supabase()
+    if not sb:
+        raise RuntimeError("Supabase not configured")
+
+    prefix = prefix.strip("/")
+    results: List[str] = []
+
+    def walk(folder: str):
+        items = sb.storage.from_(SUPABASE_BUCKET).list(path=folder)
+        for it in items:
+            name = it.get("name")
+            if not name:
+                continue
+            # folder items have "id" null sometimes; heuristic: if "metadata" missing and "name" has no dot, can still be file.
+            # Supabase returns "metadata" for files.
+            is_file = it.get("metadata") is not None
+            full = f"{folder}/{name}" if folder else name
+            if is_file:
+                results.append(full)
+            else:
+                walk(full)
+
+    walk(prefix)
+    return results
+
+
+# ----------------------------
+# DB
+# ----------------------------
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
 
 
 class AudioAsset(Base):
     __tablename__ = "audio_assets"
-
     id = Column(String, primary_key=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    original_filename = Column(String, nullable=False)
-    stored_path = Column(Text, nullable=False)  # local path or sb://bucket/key
-    file_size_bytes = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    filename = Column(String, nullable=False)
+    stored_path = Column(Text, nullable=False)
+    size_bytes = Column(Integer, default=0)
+    duration_sec = Column(Float, default=0.0)
 
     fingerprint_status = Column(String, default="pending")  # pending|done|error
     fingerprint_path = Column(Text, nullable=True)
@@ -147,1110 +248,975 @@ class AudioAsset(Base):
 
     spectrogram_path = Column(Text, nullable=True)
 
-    # Last proof info (optional)
-    proof_hash = Column(String, nullable=True)
-    tx_hash = Column(String, nullable=True)
-    explorer_url = Column(Text, nullable=True)
 
-    # Last email info (optional)
-    email_sent = Column(String, nullable=True)  # "true"/"false"
-    email_reason = Column(Text, nullable=True)
-
-
-class LibraryTrack(Base):
-    __tablename__ = "library_tracks"
-
+class LibraryItem(Base):
+    __tablename__ = "library_items"
     id = Column(String, primary_key=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     filename = Column(String, nullable=False)
-    stored_path = Column(Text, nullable=False)  # local path or sb://bucket/key
+    stored_path = Column(Text, nullable=False)
+    fingerprint_path = Column(Text, nullable=True)
+
+
+class ProofRecord(Base):
+    __tablename__ = "proof_records"
+    id = Column(String, primary_key=True, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    asset_id = Column(String, nullable=False)
+    library_id = Column(String, nullable=False)
+    sha256 = Column(String, nullable=False)
+    tx_hash = Column(String, nullable=True)
+    proof_hash = Column(String, nullable=True)
+    email_sent = Column(String, default="false")
+    email_message_id = Column(String, nullable=True)
+    email_reason = Column(Text, nullable=True)
 
 
 class MonitorIncident(Base):
     __tablename__ = "monitor_incidents"
-
     id = Column(String, primary_key=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     inbox_filename = Column(String, nullable=False)
-    inbox_path = Column(Text, nullable=False)  # local path or sb://bucket/key
-    mode = Column(String, default="vr")
-
+    inbox_path = Column(Text, nullable=False)
+    mode = Column(String, default="vr")  # vr|raw
     match_filename = Column(String, nullable=True)
     match_path = Column(Text, nullable=True)
-    common_hashes = Column(Integer, nullable=True)
-    rank = Column(Integer, nullable=True)
-    offset_sec = Column(String, nullable=True)
-
-    email_sent = Column(String, nullable=True)  # "true"/"false"
-    email_reason = Column(Text, nullable=True)  # message id or reason
+    common_hashes = Column(Integer, default=0)
+    rank = Column(Integer, default=-1)
+    offset_sec = Column(String, default="0")
+    email_sent = Column(String, default="false")
+    email_reason = Column(Text, nullable=True)
 
 
 Base.metadata.create_all(bind=engine)
 
 
-def get_db():
-    db = SessionLocal()
+# ----------------------------
+# Utility
+# ----------------------------
+def db_session():
+    return SessionLocal()
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def sha256_file_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+
+def safe_filename(name: str) -> str:
+    return name.replace("\\", "_").replace("/", "_").strip()
+
+
+def ffprobe_duration(path: Path) -> float:
+    """
+    Best-effort duration reading via ffprobe if available.
+    """
     try:
-        yield db
-    finally:
-        db.close()
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        js = json.loads(out)
+        dur = float(js["format"]["duration"])
+        return dur
+    except Exception:
+        return 0.0
 
 
-# =========================
-# Helpers (Hashing / JSON)
-# =========================
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def local_write_bytes(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
 
 
-def guess_content_type(filename: str) -> str:
-    f = filename.lower()
-    if f.endswith(".png"):
-        return "image/png"
-    if f.endswith(".jpg") or f.endswith(".jpeg"):
-        return "image/jpeg"
-    if f.endswith(".wav"):
-        return "audio/wav"
-    if f.endswith(".mp3"):
-        return "audio/mpeg"
-    if f.endswith(".flac"):
-        return "audio/flac"
-    return "application/octet-stream"
+def get_asset_dir(asset_id: str) -> Path:
+    return UPLOADS_DIR / asset_id
 
 
-def is_audio_file(name: str) -> bool:
-    ext = os.path.splitext(name)[1].lower()
-    return ext in [".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"]
+def get_fingerprint_dir(asset_id: str) -> Path:
+    return FINGERPRINTS_DIR / asset_id
 
 
-# =========================
-# Helpers (Storage abstraction)
-# =========================
-def parse_sb_uri(path: str) -> Optional[Dict[str, str]]:
-    # sb://bucket/key
-    if not path.startswith("sb://"):
-        return None
-    rest = path[5:]
-    if "/" not in rest:
-        return None
-    bucket, key = rest.split("/", 1)
-    return {"bucket": bucket, "key": key}
+def get_tmp_dir(asset_id: str) -> Path:
+    return TEMP_DIR / asset_id
 
 
-def storage_put_bytes(key: str, data: bytes, content_type: str) -> str:
+# ----------------------------
+# Email (SendGrid)
+# ----------------------------
+def send_email(subject: str, text: str) -> Dict[str, Any]:
+    if not SENDGRID_API_KEY or not EMAIL_FROM or not EMAIL_TO:
+        return {"ok": False, "reason": "SendGrid env vars not set"}
+    if not SendGridAPIClient or not Mail:
+        return {"ok": False, "reason": "sendgrid package not installed"}
+
+    try:
+        message = Mail(
+            from_email=EMAIL_FROM,
+            to_emails=EMAIL_TO,
+            subject=subject,
+            plain_text_content=text,
+        )
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        resp = sg.send(message)
+        msg_id = resp.headers.get("X-Message-Id") if hasattr(resp, "headers") else None
+        return {"ok": True, "message_id": msg_id}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
+LEGAL_DISPUTE_TEXT = """
+IMPORTANT NOTICE (Prototype / Demonstration)
+
+This notification indicates that an uploaded audio file appears to match a beat from your registered library.
+This system is a prototype and may generate false positives.
+
+If you believe this notification is incorrect, you may dispute it by:
+1) Gathering evidence of authorship and creation date (project files, session exports, stems).
+2) Comparing the allegedly matching segments using independent audio analysis tools.
+3) Contacting the uploader/platform with a formal dispute request and supporting evidence.
+4) If applicable, consulting a qualified legal professional for DMCA/takedown or rights enforcement steps.
+
+This message is not legal advice. It is provided as an example prototype notice only.
+"""
+
+
+# ----------------------------
+# Blockchain proof (simple)
+# ----------------------------
+def record_proof_on_chain(sha256_hex: str) -> Dict[str, Any]:
     """
-    Returns stored_path string:
-      local => absolute path
-      supabase => sb://<bucket>/<key>
+    Stores hash only (sha256) via contract call.
+    Expects AMOY_RPC_URL + AMOY_PRIVATE_KEY + PROOF_REGISTRY_ADDRESS.
     """
-    mode = get_mode()
+    if not (AMOY_RPC_URL and AMOY_PRIVATE_KEY and PROOF_REGISTRY_ADDRESS):
+        return {"ok": False, "reason": "Blockchain env vars not set"}
 
-    if mode == "supabase":
-        sb = get_sb()
-        sb.upload_bytes(key, data, content_type=content_type)
-        return f"sb://{sb.bucket}/{key}"
+    if not Web3:
+        return {"ok": False, "reason": "web3 not installed"}
 
-    # local
-    abs_path = STORAGE_ROOT / key.replace("/", os.sep)
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
-    abs_path.write_bytes(data)
-    return str(abs_path)
+    # Minimal ABI: eventless storeHash(bytes32)
+    abi = [
+        {
+            "inputs": [{"internalType": "bytes32", "name": "h", "type": "bytes32"}],
+            "name": "storeHash",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        }
+    ]
+
+    try:
+        w3 = Web3(Web3.HTTPProvider(AMOY_RPC_URL))
+        acct = w3.eth.account.from_key(AMOY_PRIVATE_KEY)
+        contract = w3.eth.contract(address=Web3.to_checksum_address(PROOF_REGISTRY_ADDRESS), abi=abi)
+
+        h_bytes32 = bytes.fromhex(sha256_hex)
+        if len(h_bytes32) != 32:
+            return {"ok": False, "reason": "sha256 must be 32 bytes"}
+
+        tx = contract.functions.storeHash(h_bytes32).build_transaction(
+            {
+                "from": acct.address,
+                "nonce": w3.eth.get_transaction_count(acct.address),
+                "chainId": w3.eth.chain_id,
+            }
+        )
+
+        # Let node fill gas fields where possible; if it fails you can tune.
+        signed = w3.eth.account.sign_transaction(tx, AMOY_PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        return {"ok": True, "tx_hash": tx_hash.hex(), "from": acct.address}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
 
 
-def storage_put_file(key: str, file_path: str, content_type: str) -> str:
-    mode = get_mode()
-
-    if mode == "supabase":
-        sb = get_sb()
-        sb.upload_file(key, file_path, content_type=content_type)
-        return f"sb://{sb.bucket}/{key}"
-
-    abs_path = STORAGE_ROOT / key.replace("/", os.sep)
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(file_path, str(abs_path))
-    return str(abs_path)
-
-
-def storage_get_to_temp(stored_path: str) -> str:
+# ----------------------------
+# MVP fingerprint / matching (exact equality)
+# ----------------------------
+def mvp_fingerprint_bytes(data: bytes) -> str:
     """
-    Given a stored_path (local absolute path OR sb://bucket/key),
-    return a local temp filename containing the bytes.
+    MVP: fingerprint = sha256 over bytes.
     """
-    mode = get_mode()
-
-    # If it is a local absolute path:
-    if mode == "local" and not stored_path.startswith("sb://"):
-        if not os.path.exists(stored_path):
-            raise FileNotFoundError(stored_path)
-        return stored_path
-
-    sb_info = parse_sb_uri(stored_path)
-    if not sb_info:
-        # might still be local path in supabase mode (shouldn't happen but handle)
-        if os.path.exists(stored_path):
-            return stored_path
-        raise FileNotFoundError(stored_path)
-
-    sb = get_sb()
-    key = sb_info["key"]
-    data = sb.download_bytes(key)
-
-    suffix = os.path.splitext(key)[1] or ".bin"
-    tmp_dir = tempfile.mkdtemp(prefix="sampledetect_")
-    tmp_path = os.path.join(tmp_dir, f"dl{suffix}")
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-    return tmp_path
+    return sha256_file_bytes(data)
 
 
-def storage_read_bytes(stored_path: str) -> bytes:
-    mode = get_mode()
+# ----------------------------
+# Audfprint runner
+# ----------------------------
+def run_audfprint(args: List[str], cwd: Optional[Path] = None) -> str:
+    """
+    Run: python audfprint.py <cmd> ... and return stdout+stderr (tail if huge).
+    Uses sys.executable and vendored audfprint path for cross-platform.
+    """
+    if not Path(AUDPRINT_PY).exists():
+        raise RuntimeError(f"Vendored audfprint not found at: {AUDPRINT_PY}")
 
-    if mode == "local" and not stored_path.startswith("sb://"):
-        return Path(stored_path).read_bytes()
+    cmd = [sys.executable, AUDPRINT_PY] + args
 
-    sb_info = parse_sb_uri(stored_path)
-    if not sb_info:
-        return Path(stored_path).read_bytes()
-
-    sb = get_sb()
-    return sb.download_bytes(sb_info["key"])
-
-
-def storage_delete_path(stored_path: str) -> None:
-    mode = get_mode()
-
-    if mode == "local" and not stored_path.startswith("sb://"):
-        try:
-            os.remove(stored_path)
-        except Exception:
-            pass
-        return
-
-    sb_info = parse_sb_uri(stored_path)
-    if sb_info:
-        sb = get_sb()
-        try:
-            sb.remove(sb_info["key"])
-        except Exception:
-            pass
-
-
-# =========================
-# Helpers (ffmpeg)
-# =========================
-def run_ffmpeg(args: List[str]) -> None:
-    cmd = [FFMPEG] + args
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    out = p.stdout or ""
     if p.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {p.stderr[:4000]}")
-
-
-def make_vr_variant(input_path: str, out_path: str, variant: str) -> None:
-    """
-    VR preprocessing variant for audfprint matching.
-    We always resample to 11025 mono s16 wav to match audfprint defaults.
-    """
-    if variant == "vr":
-        # Basic vocal-resistant band-pass / mono / 11025
-        # band 80-2000 is a good general choice for beat structure
-        run_ffmpeg([
-            "-y", "-i", input_path,
-            "-vn",
-            "-af", "highpass=f=80,lowpass=f=2000,acompressor=threshold=-18dB:ratio=2:attack=5:release=50",
-            "-ac", "1",
-            "-ar", "11025",
-            out_path
-        ])
-        return
-
-    # normal
-    run_ffmpeg([
-        "-y", "-i", input_path,
-        "-vn",
-        "-ac", "1",
-        "-ar", "11025",
-        out_path
-    ])
-
-
-def make_spectrogram_png(input_path: str, out_png: str) -> None:
-    # Good looking spectrogram
-    run_ffmpeg([
-        "-y", "-i", input_path,
-        "-lavfi", "showspectrumpic=s=1200x400:legend=disabled:mode=separate",
-        out_png
-    ])
-
-
-# =========================
-# Helpers (audfprint)
-# =========================
-MATCH_LINE_RE = re.compile(
-    r"Matched\s+(?P<query>.+?)\s+.+?\s+as\s+(?P<match>.+?)\s+at\s+(?P<offset>-?\d+\.?\d*)\s+s\s+with\s+(?P<common>\d+)\s+of\s+(?P<total>\d+)\s+common\s+hashes\s+at\s+rank\s+(?P<rank>\d+)",
-    re.IGNORECASE
-)
-
-
-def run_audfprint(cmd_args: List[str]) -> str:
-    """
-    Runs audfprint.py using your venv python if provided,
-    else uses current python.
-    """
-    py = PYTHON_EXE or sys.executable  # type: ignore
-    full = [py, AUDFPRINT_PY] + cmd_args
-    p = subprocess.run(full, capture_output=True, text=True)
-    out = (p.stdout or "") + "\n" + (p.stderr or "")
-    if p.returncode != 0:
+        # raise tail for readability
         raise RuntimeError(out[-4000:])
     return out
 
 
-def parse_audfprint_output(raw: str) -> Optional[Dict[str, Any]]:
-    lines = raw.splitlines()
-    # find best "Matched ..." line
-    for line in reversed(lines):
-        m = MATCH_LINE_RE.search(line)
-        if m:
-            return {
-                "match_path": m.group("match").strip(),
-                "match_filename": os.path.basename(m.group("match").strip()),
-                "offset_sec": float(m.group("offset")),
-                "common_hashes": int(m.group("common")),
-                "total_common_candidates": int(m.group("total")),
-                "rank": int(m.group("rank")),
-                "raw_line": line.strip()
-            }
-    return None
-
-
-def build_audfprint_file_list_local() -> int:
-    ensure_local_dirs()
-    files = []
-    for p in LIBRARY_AUDIO_DIR.rglob("*"):
-        if p.is_file() and is_audio_file(p.name):
-            files.append(str(p))
-    AUDFPRINT_DIR.mkdir(parents=True, exist_ok=True)
-    # ASCII avoids BOM issues
-    AUDFPRINT_FILES_TXT_LOCAL.write_text("\n".join(files), encoding="ascii", errors="ignore")
-    return len(files)
-
-
-def audfprint_index_local() -> Dict[str, Any]:
-    files_listed = build_audfprint_file_list_local()
-    if files_listed == 0:
-        return {"ok": True, "files_listed": 0, "note": "No files in library_audio."}
-
-    AUDFPRINT_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "new",
-        "--dbase", str(AUDFPRINT_PKLZ_LOCAL),
-        "-l", str(AUDFPRINT_FILES_TXT_LOCAL)
-    ]
-    raw = run_audfprint(cmd)
-    return {"ok": True, "files_listed": files_listed, "db_path": str(AUDFPRINT_PKLZ_LOCAL), "raw_tail": raw[-1200:]}
-
-
 def audfprint_index_supabase(db) -> Dict[str, Any]:
     """
-    Hosted minimal: uses DB library_tracks as the source of truth.
-    Downloads each library track to /tmp and builds a pklz, then uploads to Supabase.
+    Build audfprint DB from Supabase folder: library_audio/
+    Writes DB to /tmp then uploads to Supabase under audfprint/library.pklz + audfprint/library_files.txt
     """
-    sb = get_sb()
-    tmp_dir = tempfile.mkdtemp(prefix="audf_lib_")
-    tmp_audio_dir = os.path.join(tmp_dir, "library_audio")
-    os.makedirs(tmp_audio_dir, exist_ok=True)
+    if STORAGE_MODE != "supabase":
+        raise HTTPException(status_code=400, detail="STORAGE_MODE must be 'supabase' for this endpoint")
 
-    tracks = db.query(LibraryTrack).all()
-    if not tracks:
-        return {"ok": True, "files_listed": 0, "note": "No library tracks in DB. Use /library/index first."}
+    # Collect library audio keys
+    keys = sb_recursive_collect("library_audio")
+    audio_keys = [k for k in keys if k.lower().endswith((".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"))]
 
-    file_list = []
-    for t in tracks:
-        local_path = storage_get_to_temp(t.stored_path)
-        # move into tmp_audio_dir with safe filename
-        safe_name = re.sub(r"[^a-zA-Z0-9_\-\. ]", "_", t.filename)
-        dest = os.path.join(tmp_audio_dir, safe_name)
-        shutil.copyfile(local_path, dest)
-        file_list.append(dest)
+    if not audio_keys:
+        return {"ok": False, "reason": "No files found under supabase: library_audio/"}
 
-    files_txt = os.path.join(tmp_dir, "library_files.txt")
-    with open(files_txt, "w", encoding="ascii", errors="ignore") as f:
-        f.write("\n".join(file_list))
-
-    out_pklz = os.path.join(tmp_dir, "library.pklz")
-    raw = run_audfprint(["new", "--dbase", out_pklz, "-l", files_txt])
-
-    # upload pklz to supabase storage
-    key = sb_key("audfprint", "library.pklz")
-    storage_put_file(key, out_pklz, "application/octet-stream")
-
-    return {"ok": True, "files_listed": len(tracks), "db_key": key, "raw_tail": raw[-1200:]}
-
-
-def audfprint_match(asset_path_local: str, db_path_local: str) -> Dict[str, Any]:
-    raw = run_audfprint(["match", "--dbase", db_path_local, asset_path_local])
-    best = parse_audfprint_output(raw)
-    return {"best": best, "raw_tail": raw[-2000:]}
-
-
-# =========================
-# Email helpers
-# =========================
-def send_email(subject: str, html: str) -> Dict[str, Any]:
-    api_key = env("SENDGRID_API_KEY")
-    email_from = env("EMAIL_FROM")
-    email_to = env("EMAIL_TO")
-
-    if not api_key or not email_from or not email_to:
-        return {"sent": False, "reason": "Missing SENDGRID_API_KEY/EMAIL_FROM/EMAIL_TO", "status_code": None}
-
-    if SendGridAPIClient is None or Mail is None:
-        return {"sent": False, "reason": "SendGrid libs not installed", "status_code": None}
-
+    workdir = Path(tempfile.mkdtemp(prefix="audf_idx_"))
     try:
-        message = Mail(
-            from_email=email_from,
-            to_emails=email_to,
-            subject=subject,
-            html_content=html,
-        )
-        sg = SendGridAPIClient(api_key)
-        resp = sg.send(message)
-        # SendGrid sometimes returns header "X-Message-Id"
-        msg_id = None
-        try:
-            msg_id = resp.headers.get("X-Message-Id")
-        except Exception:
-            msg_id = None
-        return {"sent": True, "status_code": resp.status_code, "message_id": msg_id}
+        local_audio_dir = workdir / "library_audio"
+        local_audio_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download files locally for indexing
+        downloaded = 0
+        errors = 0
+        for key in audio_keys:
+            try:
+                data = sb_download_bytes(key)
+                fname = safe_filename(Path(key).name)
+                local_write_bytes(local_audio_dir / fname, data)
+                downloaded += 1
+            except Exception:
+                errors += 1
+
+        files_txt = workdir / "library_files.txt"
+        # Write absolute paths (audfprint handles)
+        lines = [str(p.resolve()) for p in sorted(local_audio_dir.glob("*"))]
+        files_txt.write_text("\n".join(lines), encoding="utf-8")
+
+        out_pklz = workdir / "library.pklz"
+
+        # Build database from list file
+        raw = run_audfprint(["new", "--dbase", str(out_pklz), "-l", str(files_txt)], cwd=workdir)
+
+        # Upload outputs back to Supabase
+        sb_upload_bytes("audfprint/library.pklz", out_pklz.read_bytes(), content_type="application/octet-stream")
+        sb_upload_bytes("audfprint/library_files.txt", files_txt.read_bytes(), content_type="text/plain")
+
+        return {
+            "ok": True,
+            "downloaded": downloaded,
+            "download_errors": errors,
+            "db_uploaded_to": "audfprint/library.pklz",
+            "files_uploaded_to": "audfprint/library_files.txt",
+            "raw_output_tail": raw[-1200:],
+        }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def audfprint_match_asset_supabase(asset_bytes: bytes, mode: str = "vr") -> Dict[str, Any]:
+    """
+    Match uploaded asset against Supabase audfprint DB.
+    mode:
+      - raw: convert to 11025 mono wav then match
+      - vr: apply simple band-pass filter to reduce vocal energy then match (ffmpeg)
+    """
+    if STORAGE_MODE != "supabase":
+        raise HTTPException(status_code=400, detail="STORAGE_MODE must be 'supabase' for this endpoint")
+
+    # Download DB
+    try:
+        db_bytes = sb_download_bytes("audfprint/library.pklz")
     except Exception as e:
-        return {"sent": False, "reason": str(e), "status_code": None}
+        return {"ok": False, "reason": f"Could not download audfprint DB from supabase: {e}"}
 
-
-def make_dispute_template_html(inbox_filename: str, match_filename: str, common_hashes: int, rank: int, offset_sec: float) -> str:
-    # Template / example only
-    utc_now = datetime.utcnow().isoformat() + "Z"
-    return f"""
-    <h2>Potential Unauthorized Upload Detected ✅</h2>
-    <p><b>Inbox file:</b> {inbox_filename}</p>
-
-    <hr/>
-
-    <h3>Match Summary</h3>
-    <p><b>Matched beat:</b> {match_filename}</p>
-    <p><b>Common hashes:</b> {common_hashes}</p>
-    <p><b>Rank:</b> {rank}</p>
-    <p><b>Offset (sec):</b> {offset_sec}</p>
-
-    <p style="color:#777; font-size:12px;">
-    This alert was generated by SampleDetect SAE (prototype). The "monitor inbox" simulates external platform uploads.
-    </p>
-
-    <hr/>
-
-    <h3>Template Dispute / Takedown Notice (Example Only — Not Legal Advice)</h3>
-    <p style="color:#666; font-size:12px;">
-    Use this as a starting point when contacting a platform or uploader. Modify to fit your situation and local laws.
-    </p>
-
-    <div style="border:1px solid #ddd; padding:12px; border-radius:10px; background:#fafafa;">
-    <p><b>Subject:</b> Notice of Unauthorized Use of Copyrighted Sound Recording / Beat</p>
-
-    <p>Hello,</p>
-
-    <p>
-    I am the copyright owner (or authorized representative) of the musical work / sound recording titled:
-    <b>[YOUR BEAT TITLE]</b> by <b>[YOUR NAME / PRODUCER NAME]</b>.
-    </p>
-
-    <p>
-    I have identified content that appears to use my copyrighted audio without authorization.
-    Below is evidence generated by an audio-fingerprint detection tool:
-    </p>
-
-    <ul>
-      <li><b>Detected upload file name:</b> {inbox_filename}</li>
-      <li><b>Matched reference beat:</b> {match_filename}</li>
-      <li><b>Detection confidence indicators:</b> common_hashes={common_hashes}, rank={rank}, offset={offset_sec}</li>
-      <li><b>Detection timestamp (system time):</b> {utc_now}</li>
-    </ul>
-
-    <p>
-    I request that you (a) remove/disable access to the infringing content, or (b) initiate your dispute/appeal workflow so ownership can be verified.
-    I can provide additional verification upon request, including project/session files, stems, and proof-of-creation metadata.
-    </p>
-
-    <p>
-    Please confirm receipt of this notice and advise next steps within <b>[7]</b> business days.
-    </p>
-
-    <p>
-    Sincerely,<br/>
-    <b>[YOUR NAME]</b><br/>
-    <b>[YOUR EMAIL]</b><br/>
-    <b>[YOUR WEBSITE / PORTFOLIO LINK]</b><br/>
-    </p>
-    </div>
-
-    <hr/>
-
-    <p style="color:#777; font-size:12px;">
-    Important: This is a template for demonstration purposes and does not constitute legal advice.
-    </p>
-    """
-
-
-# =========================
-# Blockchain proof helper
-# =========================
-PROOF_ABI = [
-    {
-        "inputs": [{"internalType": "bytes32", "name": "proofHash", "type": "bytes32"}],
-        "name": "recordProof",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    }
-]
-
-def record_proof_on_chain(proof_hash_hex: str) -> Dict[str, Any]:
-    """
-    Records a bytes32 hash to Polygon Amoy using ProofRegistry contract.
-    Requires: AMOY_RPC_URL, AMOY_PRIVATE_KEY, PROOF_REGISTRY_ADDRESS
-    """
-    rpc = env("AMOY_RPC_URL")
-    pk = env("AMOY_PRIVATE_KEY")
-    addr = env("PROOF_REGISTRY_ADDRESS")
-
-    if not rpc or not pk or not addr:
-        return {"ok": False, "reason": "Missing AMOY_RPC_URL / AMOY_PRIVATE_KEY / PROOF_REGISTRY_ADDRESS"}
-
-    if Web3 is None:
-        return {"ok": False, "reason": "web3 not installed"}
-
-    w3 = Web3(Web3.HTTPProvider(rpc))
-    acct = w3.eth.account.from_key(pk)
-
-    contract = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=PROOF_ABI)
-
-    # bytes32 from hex string
-    b = bytes.fromhex(proof_hash_hex)
-    if len(b) != 32:
-        # hash hex is 64 chars => 32 bytes. If not, compress using sha256 again:
-        b = hashlib.sha256(b).digest()
-
-    nonce = w3.eth.get_transaction_count(acct.address)
-    tx = contract.functions.recordProof(b).build_transaction({
-        "from": acct.address,
-        "nonce": nonce,
-        "chainId": w3.eth.chain_id,
-        "gas": 200000,
-    })
-
-    # Let node suggest fees if possible; fallback
+    workdir = Path(tempfile.mkdtemp(prefix="audf_match_"))
     try:
-        tx["maxFeePerGas"] = w3.eth.gas_price
-        tx["maxPriorityFeePerGas"] = w3.eth.gas_price
-    except Exception:
-        pass
+        db_path = workdir / "library.pklz"
+        db_path.write_bytes(db_bytes)
 
-    signed = acct.sign_transaction(tx)
-    txh = w3.eth.send_raw_transaction(signed.rawTransaction)
-    tx_hash = txh.hex()
-    explorer = f"https://amoy.polygonscan.com/tx/{tx_hash}"
-    return {"ok": True, "tx_hash": tx_hash, "explorer_url": explorer, "from": acct.address}
+        input_path = workdir / "query_in"
+        input_path.write_bytes(asset_bytes)
+
+        # Build wav query
+        wav_query = workdir / "query.wav"
+        if mode == "raw":
+            cmd = ["ffmpeg", "-y", "-i", str(input_path), "-ac", "1", "-ar", "11025", str(wav_query)]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        else:
+            # Vocal resistant: band-pass roughly 80-2000Hz (works OK for beat backbone)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-ac",
+                "1",
+                "-ar",
+                "11025",
+                "-af",
+                "highpass=f=80,lowpass=f=2000",
+                str(wav_query),
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        # Match
+        raw = run_audfprint(["match", "--dbase", str(db_path), str(wav_query)], cwd=workdir)
+
+        # Parse best line if present
+        best: Dict[str, Any] = {}
+        tail = raw.strip().splitlines()[-5:]
+        for line in raw.splitlines():
+            if line.startswith("Matched "):
+                # Example line:
+                # Matched <query> ... as <matchfile> at -0.0 s with 1047 of 2337 common hashes at rank 0
+                best["line"] = line
+                # crude extraction
+                try:
+                    parts = line.split(" as ", 1)[1]
+                    match_path = parts.split(" at ", 1)[0].strip()
+                    best["match_path"] = match_path
+                    best["match_filename"] = Path(match_path).name
+                except Exception:
+                    pass
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "best": best,
+            "raw_output_tail": "\n".join(tail),
+            "note": "audfprint is reliable matcher (constellation hashes + alignment).",
+        }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
-# =========================
-# FastAPI app
-# =========================
-app = FastAPI(title="SampleDetect SAE API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # ok for prototype
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
+# ----------------------------
+# API
+# ----------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "mode": get_mode(), "time": datetime.utcnow().isoformat() + "Z"}
+    return {"ok": True, "storage_mode": STORAGE_MODE, "time": now_utc().isoformat()}
 
 
-# =========================
-# Assets
-# =========================
 @app.post("/upload")
-async def upload_audio(file: UploadFile = File(...), db=Depends(get_db)):
+async def upload_audio(file: UploadFile = File(...)):
     """
-    Upload audio asset.
-    - local: writes to STORAGE_ROOT/uploads/<id>/original.<ext>
-    - supabase: writes to bucket key uploads/<id>/original.<ext> (sb://...)
+    Upload audio file as an "asset" (for matching / fingerprinting).
+    In supabase mode: stores under uploads/<asset_id>/original.<ext>
+    In local mode: stores under STORAGE_ROOT/uploads/<asset_id>/original.<ext>
     """
     asset_id = str(uuid.uuid4())
-    filename = file.filename or "upload.bin"
-    ext = os.path.splitext(filename)[1] or ".bin"
-    key = sb_key("uploads", asset_id, f"original{ext}")
+    filename = safe_filename(file.filename or "upload.bin")
+    ext = Path(filename).suffix.lower() or ".bin"
 
     data = await file.read()
-    stored_path = storage_put_bytes(key, data, content_type=file.content_type or guess_content_type(filename))
+    size = len(data)
 
-    a = AudioAsset(
-        id=asset_id,
-        original_filename=filename,
-        stored_path=stored_path,
-        file_size_bytes=len(data),
-        fingerprint_status="pending",
-    )
-    db.add(a)
-    db.commit()
+    stored_path = ""
+    local_tmp = None
 
-    return {"ok": True, "id": asset_id, "stored_path": stored_path, "size": len(data)}
+    if STORAGE_MODE == "supabase":
+        key = f"uploads/{asset_id}/original{ext}"
+        sb_upload_bytes(key, data, content_type=file.content_type or "application/octet-stream")
+        stored_path = key
+        duration = 0.0
+    else:
+        ensure_local_dirs()
+        asset_dir = get_asset_dir(asset_id)
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        local_path = asset_dir / f"original{ext}"
+        local_write_bytes(local_path, data)
+        stored_path = str(local_path)
+        duration = ffprobe_duration(local_path)
+
+    db = db_session()
+    try:
+        a = AudioAsset(
+            id=asset_id,
+            filename=filename,
+            stored_path=stored_path,
+            size_bytes=size,
+            duration_sec=float(duration),
+            fingerprint_status="pending",
+        )
+        db.add(a)
+        db.commit()
+        return {"id": asset_id, "filename": filename, "stored_path": stored_path, "size_bytes": size}
+    finally:
+        db.close()
 
 
 @app.get("/assets")
-def list_assets(db=Depends(get_db)):
-    assets = db.query(AudioAsset).order_by(AudioAsset.created_at.desc()).all()
-    out = []
-    for a in assets:
-        out.append({
-            "id": a.id,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-            "original_filename": a.original_filename,
-            "stored_path": a.stored_path,
-            "file_size_bytes": a.file_size_bytes,
-            "fingerprint_status": a.fingerprint_status,
-            "fingerprint_path": a.fingerprint_path,
-            "fingerprint_error": a.fingerprint_error,
-            "spectrogram_url": f"/assets/{a.id}/spectrogram.png" if a.spectrogram_path else None,
-            "proof_hash": a.proof_hash,
-            "tx_hash": a.tx_hash,
-            "explorer_url": a.explorer_url,
-            "email_sent": True if a.email_sent == "true" else (False if a.email_sent == "false" else None),
-            "email_reason": a.email_reason,
-        })
-    return out
+def list_assets(limit: int = 50):
+    db = db_session()
+    try:
+        assets = db.query(AudioAsset).order_by(AudioAsset.created_at.desc()).limit(limit).all()
+        out = []
+        for a in assets:
+            out.append(
+                {
+                    "id": a.id,
+                    "created_at": a.created_at.isoformat() if a.created_at else None,
+                    "filename": a.filename,
+                    "stored_path": a.stored_path,
+                    "size_bytes": a.size_bytes,
+                    "duration_sec": a.duration_sec,
+                    "fingerprint_status": a.fingerprint_status,
+                    "fingerprint_path": a.fingerprint_path,
+                    "fingerprint_error": a.fingerprint_error,
+                    "spectrogram_path": a.spectrogram_path,
+                }
+            )
+        return out
+    finally:
+        db.close()
 
 
-@app.post("/assets/clear")
-def clear_assets(db=Depends(get_db)):
+@app.post("/assets/clear_recent")
+def clear_recent_assets(delete_files: bool = False):
     """
-    Deletes only uploaded assets (not library tracks).
-    Also deletes related stored objects (uploads/fingerprints/spectrograms) for those assets.
+    Clears the "Recent Uploads" list by deleting asset rows from DB.
+    DOES NOT touch library, proofs, incidents.
+    By default does NOT delete storage files (safe for demo).
     """
-    assets = db.query(AudioAsset).all()
-    deleted = 0
+    db = db_session()
+    try:
+        assets = db.query(AudioAsset).all()
+        # optionally delete stored objects
+        if delete_files:
+            if STORAGE_MODE == "supabase":
+                sb = supabase()
+                if sb:
+                    for a in assets:
+                        try:
+                            sb.storage.from_(SUPABASE_BUCKET).remove([a.stored_path])
+                        except Exception:
+                            pass
+            else:
+                for a in assets:
+                    try:
+                        p = Path(a.stored_path)
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        pass
 
-    for a in assets:
-        # remove upload
-        storage_delete_path(a.stored_path)
-        # remove fingerprint
-        if a.fingerprint_path:
-            storage_delete_path(a.fingerprint_path)
-        # remove spectrogram
-        if a.spectrogram_path:
-            storage_delete_path(a.spectrogram_path)
-
-        db.delete(a)
-        deleted += 1
-
-    db.commit()
-    return {"ok": True, "deleted_assets": deleted}
+        for a in assets:
+            db.delete(a)
+        db.commit()
+        return {"ok": True, "cleared": len(assets), "deleted_files": delete_files}
+    finally:
+        db.close()
 
 
 @app.post("/assets/{asset_id}/fingerprint")
-def fingerprint_asset(asset_id: str, db=Depends(get_db)):
+def fingerprint_asset(asset_id: str):
     """
-    Fingerprints the uploaded file and stores fingerprint.json.
-    This is the MVP fingerprint (sha256 + metadata), not audfprint.
+    MVP fingerprint: sha256 of original file bytes.
+    Stores fingerprint.json under fingerprints/<id>/fingerprint.json (local or supabase)
     """
-    a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Asset not found")
-
+    db = db_session()
     try:
-        b = storage_read_bytes(a.stored_path)
-        fp = {
-            "id": a.id,
-            "filename": a.original_filename,
-            "sha256": sha256_bytes(b),
-            "size": len(b),
-            "created_at": datetime.utcnow().isoformat() + "Z",
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        if not a:
+            raise HTTPException(status_code=404, detail="asset not found")
+
+        # Load bytes
+        if STORAGE_MODE == "supabase":
+            original = sb_download_bytes(a.stored_path)
+        else:
+            original = Path(a.stored_path).read_bytes()
+
+        fp = mvp_fingerprint_bytes(original)
+        fp_obj = {
+            "id": asset_id,
+            "fingerprint": fp,
+            "created_at": now_utc().isoformat(),
         }
-        key = sb_key("fingerprints", a.id, "fingerprint.json")
-        fp_path = storage_put_bytes(key, json.dumps(fp, indent=2).encode("utf-8"), content_type="application/json")
+        fp_json = json.dumps(fp_obj, indent=2).encode("utf-8")
+
+        if STORAGE_MODE == "supabase":
+            out_key = f"fingerprints/{asset_id}/fingerprint.json"
+            sb_upload_bytes(out_key, fp_json, content_type="application/json")
+            a.fingerprint_path = out_key
+        else:
+            ensure_local_dirs()
+            out_path = get_fingerprint_dir(asset_id) / "fingerprint.json"
+            local_write_bytes(out_path, fp_json)
+            a.fingerprint_path = str(out_path)
 
         a.fingerprint_status = "done"
-        a.fingerprint_path = fp_path
         a.fingerprint_error = None
         db.commit()
 
-        return {"ok": True, "id": a.id, "fingerprint_status": "done", "fingerprint_path": fp_path, "fingerprint_preview": fp["sha256"][:32]}
+        return {
+            "id": asset_id,
+            "fingerprint_status": a.fingerprint_status,
+            "fingerprint_path": a.fingerprint_path,
+            "fingerprint_preview": fp[:64] + "...",
+        }
     except Exception as e:
-        a.fingerprint_status = "error"
-        a.fingerprint_error = str(e)
-        db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        if a:
+            a.fingerprint_status = "error"
+            a.fingerprint_error = str(e)
+            db.commit()
+        raise
+    finally:
+        db.close()
 
 
-@app.post("/assets/{asset_id}/match")
-def match_asset_mvp(asset_id: str, db=Depends(get_db)):
-    """
-    MVP matcher: compares against library filenames using RapidFuzz.
-    Returns top_5 with pseudo scores.
-    """
-    if fuzz is None:
-        raise HTTPException(status_code=500, detail="rapidfuzz not installed")
-
-    tracks = db.query(LibraryTrack).all()
-    if not tracks:
-        raise HTTPException(status_code=400, detail="Library empty. Run /library/index first.")
-
-    a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Asset not found")
-
-    # Compare by name similarity (prototype)
-    scores = []
-    for t in tracks:
-        s = fuzz.token_set_ratio(a.original_filename.lower(), t.filename.lower())
-        scores.append({"score": float(s), "library_id": t.id, "filename": t.filename})
-    scores.sort(key=lambda x: x["score"], reverse=True)
-    return {"asset_id": a.id, "match_type": "mvp_filename_similarity", "top_5": scores[:5]}
-
-
-# =========================
-# Library
-# =========================
 @app.post("/library/index")
-def library_index(db=Depends(get_db)):
+def index_library():
     """
     Index library audio:
-    - local: scans STORAGE_ROOT/library_audio and stores list in DB
-    - supabase: scans supabase keys under library_audio/ and stores in DB
+      - local: scans STORAGE_ROOT/library_audio
+      - supabase: scans bucket folder library_audio/
+    Creates LibraryItem rows
     """
-    mode = get_mode()
-
-    # clear existing library rows (re-index)
-    db.query(LibraryTrack).delete()
-    db.commit()
-
-    added = 0
-    errors = 0
-
-    if mode == "local":
-        ensure_local_dirs()
-        for p in LIBRARY_AUDIO_DIR.rglob("*"):
-            if p.is_file() and is_audio_file(p.name):
-                t = LibraryTrack(
-                    id=str(uuid.uuid4()),
-                    filename=p.name,
-                    stored_path=str(p),
-                )
-                db.add(t)
-                added += 1
+    db = db_session()
+    try:
+        # Clear existing library rows
+        db.query(LibraryItem).delete()
         db.commit()
-        return {"ok": True, "mode": "local", "added": added, "errors": errors}
 
-    # supabase mode
-    sb = get_sb()
-    # list is limited; but for demo we only store direct children of library_audio/
-    # We'll list the "library_audio" folder and store all audio-looking keys.
-    items = sb.sb.list(path="library_audio")
-    for it in items:
-        name = it.get("name") or ""
-        if not name:
-            continue
-        if is_audio_file(name):
-            key = sb_key("library_audio", name)
-            t = LibraryTrack(
-                id=str(uuid.uuid4()),
-                filename=name,
-                stored_path=f"sb://{sb.bucket}/{key}",
-            )
-            db.add(t)
-            added += 1
-    db.commit()
-    return {"ok": True, "mode": "supabase", "added": added, "errors": errors, "note": "Upload demo library files to Supabase Storage folder: library_audio/"}
+        added = 0
+        errors = 0
+
+        if STORAGE_MODE == "supabase":
+            keys = sb_recursive_collect("library_audio")
+            audio_keys = [k for k in keys if k.lower().endswith((".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"))]
+            for key in audio_keys:
+                try:
+                    lid = str(uuid.uuid4())
+                    item = LibraryItem(
+                        id=lid,
+                        filename=Path(key).name,
+                        stored_path=key,
+                    )
+                    db.add(item)
+                    added += 1
+                except Exception:
+                    errors += 1
+        else:
+            ensure_local_dirs()
+            for p in LIBRARY_AUDIO_DIR.glob("**/*"):
+                if p.is_file() and p.suffix.lower() in [".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"]:
+                    try:
+                        lid = str(uuid.uuid4())
+                        item = LibraryItem(id=lid, filename=p.name, stored_path=str(p))
+                        db.add(item)
+                        added += 1
+                    except Exception:
+                        errors += 1
+
+        db.commit()
+        return {"ok": True, "indexed": added, "errors": errors}
+    finally:
+        db.close()
 
 
 @app.get("/library")
-def list_library(db=Depends(get_db)):
-    tracks = db.query(LibraryTrack).order_by(LibraryTrack.created_at.desc()).all()
-    return [
-        {
-            "id": t.id,
-            "filename": t.filename,
-            "stored_path": t.stored_path,
-            "created_at": t.created_at.isoformat() if t.created_at else None
-        }
-        for t in tracks
-    ]
+def list_library(limit: int = 200):
+    db = db_session()
+    try:
+        items = db.query(LibraryItem).order_by(LibraryItem.created_at.desc()).limit(limit).all()
+        return [
+            {
+                "id": it.id,
+                "created_at": it.created_at.isoformat() if it.created_at else None,
+                "filename": it.filename,
+                "stored_path": it.stored_path,
+                "fingerprint_path": it.fingerprint_path,
+            }
+            for it in items
+        ]
+    finally:
+        db.close()
 
 
-# =========================
-# audfprint
-# =========================
-@app.post("/audfprint/index")
-def audfprint_index(db=Depends(get_db)):
+@app.post("/assets/{asset_id}/match")
+def match_asset_mvp(asset_id: str):
     """
-    Builds audfprint database:
-    - local: writes to STORAGE_ROOT/audfprint/library.pklz
-    - supabase: downloads library tracks to /tmp, builds pklz, uploads to audfprint/library.pklz
+    MVP match: exact fingerprint equality vs library fingerprints (sha256).
+    For prototype demo only.
     """
-    mode = get_mode()
-    if mode == "local":
-        return audfprint_index_local()
-    return audfprint_index_supabase(db)
+    db = db_session()
+    try:
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        if not a:
+            raise HTTPException(status_code=404, detail="asset not found")
 
+        # read bytes
+        if STORAGE_MODE == "supabase":
+            data = sb_download_bytes(a.stored_path)
+        else:
+            data = Path(a.stored_path).read_bytes()
 
-@app.post("/audfprint/match")
-def audfprint_match_endpoint(
-    asset_id: str = Query(...),
-    mode: str = Query("vr"),
-    db=Depends(get_db)
-):
-    """
-    Reliable matching using audfprint.
-    mode=normal|vr
-    Returns best match with common hashes and rank.
-    """
-    a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Asset not found")
+        fp = mvp_fingerprint_bytes(data)
 
-    # Get audfprint DB (local path)
-    if get_mode() == "local":
-        db_path_local = str(AUDFPRINT_PKLZ_LOCAL)
-        if not os.path.exists(db_path_local):
-            raise HTTPException(status_code=400, detail="audfprint DB not found. Run /audfprint/index first.")
-    else:
-        # Supabase: download audfprint/library.pklz to temp
-        sb = get_sb()
-        pkl_uri = f"sb://{sb.bucket}/audfprint/library.pklz"
-        db_path_local = storage_get_to_temp(pkl_uri)
-        if not os.path.exists(db_path_local):
-            raise HTTPException(status_code=400, detail="audfprint DB not found in storage. Run /audfprint/index first.")
-
-    # Download asset to temp and preprocess
-    original_local = storage_get_to_temp(a.stored_path)
-
-    tmp_dir = tempfile.mkdtemp(prefix=f"audf_query_{a.id}_")
-    variant = "vr" if mode.lower() == "vr" else "normal"
-    query_wav = os.path.join(tmp_dir, f"audf_query_{variant}_{a.id}.wav")
-    make_vr_variant(original_local, query_wav, variant)
-
-    result = audfprint_match(query_wav, db_path_local)
-    best = result["best"]
-
-    payload = {
-        "asset_id": a.id,
-        "mode": variant,
-        "query_path": query_wav,
-        "db_path": db_path_local,
-        "best": best,
-        "raw_output_tail": result["raw_tail"],
-        "note": "audfprint is the reliable matcher (constellation hashes + alignment)."
-    }
-    return payload
-
-
-# =========================
-# Spectrogram
-# =========================
-@app.post("/assets/{asset_id}/spectrogram")
-def make_asset_spectrogram(asset_id: str, db=Depends(get_db)):
-    a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Asset not found")
-
-    original_local = storage_get_to_temp(a.stored_path)
-
-    tmp_dir = tempfile.mkdtemp(prefix=f"spec_{a.id}_")
-    out_png = os.path.join(tmp_dir, f"{a.id}.png")
-    make_spectrogram_png(original_local, out_png)
-
-    key = sb_key("spectrograms", f"{a.id}.png")
-    stored = storage_put_file(key, out_png, "image/png")
-
-    a.spectrogram_path = stored
-    db.commit()
-
-    return {"ok": True, "asset_id": a.id, "spectrogram_url": f"/assets/{a.id}/spectrogram.png"}
-
-
-@app.get("/assets/{asset_id}/spectrogram.png")
-def get_asset_spectrogram(asset_id: str, db=Depends(get_db)):
-    a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
-    if not a or not a.spectrogram_path:
-        raise HTTPException(status_code=404, detail="Spectrogram not found")
-
-    local_path = storage_get_to_temp(a.spectrogram_path)
-    return FileResponse(local_path, media_type="image/png")
-
-
-# =========================
-# Proofs (blockchain + email)
-# =========================
-@app.post("/proofs/record")
-def proofs_record(asset_id: str = Query(...), library_id: str = Query(...), db=Depends(get_db)):
-    """
-    Record proof:
-    - Compute proof_hash = sha256(asset_id + library_id + timestamp)
-    - Optionally write to blockchain via ProofRegistry
-    - Send email notification (SendGrid)
-    """
-    a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
-    if not a:
-        raise HTTPException(status_code=404, detail="Asset not found")
-
-    t = db.query(LibraryTrack).filter(LibraryTrack.id == library_id).first()
-    if not t:
-        raise HTTPException(status_code=404, detail="Library track not found")
-
-    payload = f"{asset_id}|{library_id}|{datetime.utcnow().isoformat()}".encode("utf-8")
-    proof_hash_hex = hashlib.sha256(payload).hexdigest()  # 64 hex chars => 32 bytes
-
-    chain = record_proof_on_chain(proof_hash_hex)
-    if chain.get("ok"):
-        a.tx_hash = chain.get("tx_hash")
-        a.explorer_url = chain.get("explorer_url")
-    else:
-        a.tx_hash = None
-        a.explorer_url = None
-
-    a.proof_hash = proof_hash_hex
-    db.commit()
-
-    # Email content
-    subject = f"SampleDetect SAE Proof Recorded ✅ {a.original_filename}"
-    html = f"""
-    <h2>Proof Recorded ✅</h2>
-    <p><b>Uploaded file:</b> {a.original_filename}</p>
-    <p><b>Matched library beat:</b> {t.filename}</p>
-    <p><b>Proof hash:</b> <code>{proof_hash_hex}</code></p>
-    <p><b>Blockchain tx:</b> {a.tx_hash or "(not recorded / missing config)"}</p>
-    <p><b>Explorer:</b> {a.explorer_url or "(n/a)"}</p>
-    <hr/>
-    <p style="color:#777;font-size:12px;">Prototype system email. Not legal advice.</p>
-    """
-
-    email = send_email(subject, html)
-    a.email_sent = "true" if email.get("sent") else "false"
-    a.email_reason = email.get("message_id") or email.get("reason")
-    db.commit()
-
-    return {
-        "ok": True,
-        "asset_id": a.id,
-        "library_id": t.id,
-        "proof_hash": proof_hash_hex,
-        "tx_hash": a.tx_hash,
-        "explorer_url": a.explorer_url,
-        "email": email,
-        "chain": chain,
-    }
-
-
-# =========================
-# Monitor (Option A: hosted inbox upload)
-# =========================
-@app.post("/monitor/upload")
-async def monitor_upload(file: UploadFile = File(...)):
-    """
-    Hosted-monitor simulation:
-    Users upload a file here to simulate "someone uploaded to Spotify/YouTube".
-    - local: saves into STORAGE_ROOT/monitor_inbox
-    - supabase: uploads into storage key monitor_inbox/<filename>
-    """
-    filename = file.filename or f"monitor_{uuid.uuid4()}.bin"
-    data = await file.read()
-    key = sb_key("monitor_inbox", filename)
-
-    if get_mode() == "supabase":
-        stored = storage_put_bytes(key, data, content_type=file.content_type or guess_content_type(filename))
-        return {"ok": True, "mode": "supabase", "monitor_key": key, "stored_path": stored}
-
-    ensure_local_dirs()
-    dest = MONITOR_INBOX_DIR / filename
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(data)
-    return {"ok": True, "mode": "local", "monitor_path": str(dest)}
-
-
-@app.post("/monitor/scan")
-def monitor_scan(mode: str = Query("vr"), db=Depends(get_db)):
-    """
-    Scans monitor inbox:
-    - local: scans STORAGE_ROOT/monitor_inbox
-    - supabase: scans bucket folder monitor_inbox/
-    For each audio file:
-      - run audfprint match (vr/normal)
-      - create MonitorIncident row
-      - send email alert (with template dispute notice)
-      - move to processed (monitor_processed/)
-    """
-    run_mode = "vr" if mode.lower() == "vr" else "normal"
-    scanned = 0
-    incidents = 0
-    errors = 0
-
-    # Ensure audfprint DB exists
-    if get_mode() == "local":
-        if not os.path.exists(str(AUDFPRINT_PKLZ_LOCAL)):
-            raise HTTPException(status_code=400, detail="audfprint DB missing. Run /audfprint/index first.")
-        db_path_local = str(AUDFPRINT_PKLZ_LOCAL)
-    else:
-        sb = get_sb()
-        pkl_uri = f"sb://{sb.bucket}/audfprint/library.pklz"
-        db_path_local = storage_get_to_temp(pkl_uri)
-        if not os.path.exists(db_path_local):
-            raise HTTPException(status_code=400, detail="audfprint DB missing in storage. Run /audfprint/index first.")
-
-    def handle_one(inbox_name: str, inbox_path: str, local_audio_path: str):
-        nonlocal incidents, errors
-
-        try:
-            # preprocess + match
-            tmp_dir = tempfile.mkdtemp(prefix="monq_")
-            query_wav = os.path.join(tmp_dir, f"mon_{run_mode}.wav")
-            make_vr_variant(local_audio_path, query_wav, "vr" if run_mode == "vr" else "normal")
-
-            res = audfprint_match(query_wav, db_path_local)
-            best = res["best"]
-
-            inc = MonitorIncident(
-                id=str(uuid.uuid4()),
-                inbox_filename=inbox_name,
-                inbox_path=inbox_path,
-                mode=run_mode,
-            )
-
-            if best:
-                inc.match_filename = best["match_filename"]
-                inc.match_path = best["match_path"]
-                inc.common_hashes = best["common_hashes"]
-                inc.rank = best["rank"]
-                inc.offset_sec = str(best["offset_sec"])
-            else:
-                inc.match_filename = None
-                inc.match_path = None
-                inc.common_hashes = None
-                inc.rank = None
-                inc.offset_sec = None
-
-            # Email if we got any best match
-            if best:
-                subject = f"SampleDetect SAE Alert ✅ Potential unauthorized use: {inbox_name}"
-                html = make_dispute_template_html(
-                    inbox_filename=inbox_name,
-                    match_filename=best["match_filename"],
-                    common_hashes=best["common_hashes"],
-                    rank=best["rank"],
-                    offset_sec=best["offset_sec"],
-                )
-                email = send_email(subject, html)
-                inc.email_sent = "true" if email.get("sent") else "false"
-                inc.email_reason = email.get("message_id") or email.get("reason")
-            else:
-                inc.email_sent = "false"
-                inc.email_reason = "No match found"
-
-            db.add(inc)
-            db.commit()
-            incidents += 1
-        except Exception as e:
-            errors += 1
-            # still record an incident row for audit
-            inc = MonitorIncident(
-                id=str(uuid.uuid4()),
-                inbox_filename=inbox_name,
-                inbox_path=inbox_path,
-                mode=run_mode,
-                email_sent="false",
-                email_reason=f"scan_error: {str(e)}",
-            )
-            db.add(inc)
-            db.commit()
-
-    # ---- local mode scanning ----
-    if get_mode() == "local":
-        ensure_local_dirs()
-        for p in MONITOR_INBOX_DIR.rglob("*"):
-            if not p.is_file():
-                continue
-            if not is_audio_file(p.name):
-                continue
-            scanned += 1
-
-            # process file
-            handle_one(p.name, str(p), str(p))
-
-            # move to processed to prevent re-alert spam
-            dest = MONITOR_PROCESSED_DIR / p.name
-            dest.parent.mkdir(parents=True, exist_ok=True)
+        # compare vs library items by hashing their stored bytes
+        lib = db.query(LibraryItem).all()
+        matches = []
+        for it in lib:
             try:
-                os.replace(str(p), str(dest))
+                if STORAGE_MODE == "supabase":
+                    b = sb_download_bytes(it.stored_path)
+                else:
+                    b = Path(it.stored_path).read_bytes()
+                lfp = mvp_fingerprint_bytes(b)
+                if lfp == fp:
+                    matches.append({"library_id": it.id, "filename": it.filename, "stored_path": it.stored_path})
             except Exception:
                 pass
 
-        return {"ok": True, "mode": "local", "scanned": scanned, "incidents": incidents, "errors": errors}
+        return {
+            "asset_id": asset_id,
+            "match_type": "exact_fingerprint",
+            "match_count": len(matches),
+            "matches": matches,
+            "note": "MVP match is exact fingerprint equality (good proof-of-work).",
+        }
+    finally:
+        db.close()
 
-    # ---- supabase mode scanning ----
-    sb = get_sb()
-    # list monitor_inbox folder
-    items = sb.sb.list(path="monitor_inbox")
-    for it in items:
-        name = it.get("name") or ""
-        if not name or not is_audio_file(name):
-            continue
 
-        scanned += 1
-        inbox_key = sb_key("monitor_inbox", name)
-        inbox_uri = f"sb://{sb.bucket}/{inbox_key}"
-        local_audio = storage_get_to_temp(inbox_uri)
+@app.post("/assets/{asset_id}/match_vr")
+def match_asset_vr_mvp(asset_id: str, threshold: int = 70):
+    """
+    MVP 'vocal-resistant' matcher (legacy): returns top candidates with heuristic scores.
+    Kept for continuity; use audfprint for reliable VR matching.
+    """
+    # Keep endpoint alive but advise audfprint
+    return {
+        "asset_id": asset_id,
+        "mode": "vocal_resistant_multi",
+        "threshold": threshold,
+        "top_5": [],
+        "matches": [],
+        "match_count": 0,
+        "note": "This legacy VR endpoint is kept for continuity. Use /assets/{id}/audfprint_match_vr for reliable matching.",
+    }
 
-        handle_one(name, inbox_uri, local_audio)
 
-        # move to processed (so we don't scan again)
+@app.post("/assets/{asset_id}/spectrogram")
+def make_spectrogram(asset_id: str):
+    """
+    Generates spectrogram PNG for asset.
+    Requires numpy + matplotlib + scipy installed.
+    """
+    if not (np and plt and wavfile):
+        raise HTTPException(status_code=500, detail="Spectrogram dependencies missing (numpy/matplotlib/scipy)")
+
+    db = db_session()
+    try:
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        if not a:
+            raise HTTPException(status_code=404, detail="asset not found")
+
+        workdir = Path(tempfile.mkdtemp(prefix="spec_"))
         try:
-            sb.sb.move(inbox_key, sb_key("monitor_processed", name))
-        except Exception:
-            pass
+            # Download asset to temp
+            in_path = workdir / "input"
+            if STORAGE_MODE == "supabase":
+                in_path.write_bytes(sb_download_bytes(a.stored_path))
+            else:
+                in_path.write_bytes(Path(a.stored_path).read_bytes())
 
-    return {"ok": True, "mode": "supabase", "scanned": scanned, "incidents": incidents, "errors": errors}
+            wav_path = workdir / "input.wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(in_path), "-ac", "1", "-ar", "22050", str(wav_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            sr, audio = wavfile.read(str(wav_path))
+            if audio.ndim > 1:
+                audio = audio[:, 0]
+
+            fig = plt.figure(figsize=(10, 4))
+            plt.specgram(audio, NFFT=2048, Fs=sr, noverlap=1024)
+            plt.xlabel("Time")
+            plt.ylabel("Frequency")
+            plt.tight_layout()
+
+            out_png = workdir / "spectrogram.png"
+            fig.savefig(str(out_png))
+            plt.close(fig)
+
+            if STORAGE_MODE == "supabase":
+                key = f"spectrograms/{asset_id}/spectrogram.png"
+                sb_upload_bytes(key, out_png.read_bytes(), content_type="image/png")
+                a.spectrogram_path = key
+            else:
+                ensure_local_dirs()
+                out_local = TEMP_DIR / asset_id / "spectrogram.png"
+                local_write_bytes(out_local, out_png.read_bytes())
+                a.spectrogram_path = str(out_local)
+
+            db.commit()
+            return {"ok": True, "asset_id": asset_id, "spectrogram_path": a.spectrogram_path}
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+    finally:
+        db.close()
+
+
+@app.get("/assets/{asset_id}/spectrogram.png")
+def get_spectrogram(asset_id: str):
+    db = db_session()
+    try:
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        if not a or not a.spectrogram_path:
+            raise HTTPException(status_code=404, detail="spectrogram not found")
+
+        if STORAGE_MODE == "supabase":
+            png = sb_download_bytes(a.spectrogram_path)
+            return Response(content=png, media_type="image/png")
+        else:
+            p = Path(a.spectrogram_path)
+            if not p.exists():
+                raise HTTPException(status_code=404, detail="spectrogram file missing")
+            return FileResponse(str(p), media_type="image/png")
+    finally:
+        db.close()
+
+
+@app.post("/audfprint/index")
+def audfprint_index():
+    """
+    Build audfprint DB from library_audio (supabase only in hosted mode).
+    """
+    db = db_session()
+    try:
+        return audfprint_index_supabase(db)
+    finally:
+        db.close()
+
+
+@app.post("/assets/{asset_id}/audfprint_match")
+def audfprint_match(asset_id: str, mode: str = Query("raw", pattern="^(raw|vr)$")):
+    db = db_session()
+    try:
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        if not a:
+            raise HTTPException(status_code=404, detail="asset not found")
+
+        if STORAGE_MODE == "supabase":
+            b = sb_download_bytes(a.stored_path)
+        else:
+            # local fallback
+            b = Path(a.stored_path).read_bytes()
+        return audfprint_match_asset_supabase(b, mode=mode)
+    finally:
+        db.close()
+
+
+@app.post("/proofs/record")
+def record_proof(asset_id: str, library_id: str):
+    """
+    Records proof for (asset, library) as:
+      - sha256 computed
+      - optional on-chain record
+      - SendGrid email
+    """
+    db = db_session()
+    try:
+        a = db.query(AudioAsset).filter(AudioAsset.id == asset_id).first()
+        it = db.query(LibraryItem).filter(LibraryItem.id == library_id).first()
+        if not a or not it:
+            raise HTTPException(status_code=404, detail="asset or library item not found")
+
+        # load bytes for hash (asset bytes)
+        if STORAGE_MODE == "supabase":
+            data = sb_download_bytes(a.stored_path)
+        else:
+            data = Path(a.stored_path).read_bytes()
+
+        h = sha256_file_bytes(data)
+
+        proof_id = str(uuid.uuid4())
+        pr = ProofRecord(id=proof_id, asset_id=asset_id, library_id=library_id, sha256=h)
+
+        # Chain record
+        chain_res = record_proof_on_chain(h)
+        if chain_res.get("ok"):
+            pr.tx_hash = chain_res.get("tx_hash")
+            pr.proof_hash = h
+        else:
+            pr.tx_hash = None
+            pr.proof_hash = None
+
+        # Email
+        subject = "SampleDetect SAE: Potential infringement detected (prototype)"
+        body = (
+            f"Asset ID: {asset_id}\n"
+            f"Library ID: {library_id}\n"
+            f"SHA256: {h}\n"
+            f"TX: {pr.tx_hash or 'N/A'}\n\n"
+            f"{LEGAL_DISPUTE_TEXT.strip()}\n"
+        )
+        email_res = send_email(subject, body)
+        pr.email_sent = "true" if email_res.get("ok") else "false"
+        pr.email_message_id = email_res.get("message_id")
+        pr.email_reason = email_res.get("reason")
+
+        db.add(pr)
+        db.commit()
+
+        return {
+            "ok": True,
+            "proof_id": proof_id,
+            "asset_id": asset_id,
+            "library_id": library_id,
+            "sha256": h,
+            "tx_hash": pr.tx_hash,
+            "email_sent": pr.email_sent,
+            "email_message_id": pr.email_message_id,
+            "email_reason": pr.email_reason,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/monitor/scan")
+def monitor_scan(mode: str = Query("vr", pattern="^(vr|raw)$")):
+    """
+    Scan monitor_inbox for files, match via audfprint, create incidents, send email.
+    Supabase mode expects objects in: monitor_inbox/
+    Local mode expects files in: STORAGE_ROOT/monitor_inbox
+    """
+    db = db_session()
+    try:
+        incidents_created = 0
+        scanned = 0
+
+        # collect inbox keys/paths
+        inbox_items: List[Dict[str, str]] = []
+
+        if STORAGE_MODE == "supabase":
+            keys = sb_recursive_collect("monitor_inbox")
+            audio_keys = [k for k in keys if k.lower().endswith((".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"))]
+            for k in audio_keys:
+                inbox_items.append({"filename": Path(k).name, "path": k})
+        else:
+            ensure_local_dirs()
+            for p in MONITOR_INBOX_DIR.glob("**/*"):
+                if p.is_file() and p.suffix.lower() in [".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"]:
+                    inbox_items.append({"filename": p.name, "path": str(p)})
+
+        for item in inbox_items:
+            scanned += 1
+
+            # avoid duplicates: if same inbox_path already logged, skip
+            existing = db.query(MonitorIncident).filter(MonitorIncident.inbox_path == item["path"]).first()
+            if existing:
+                continue
+
+            # read bytes
+            if STORAGE_MODE == "supabase":
+                b = sb_download_bytes(item["path"])
+            else:
+                b = Path(item["path"]).read_bytes()
+
+            # match
+            match_res = audfprint_match_asset_supabase(b, mode=mode)
+            best = match_res.get("best", {})
+            match_filename = best.get("match_filename")
+            match_path = best.get("match_path")
+
+            # common hashes / rank parse (best line)
+            common_hashes = 0
+            rank = -1
+            offset_sec = "0"
+            line = best.get("line", "")
+            if line:
+                # crude parse
+                try:
+                    if " with " in line and " common hashes" in line:
+                        seg = line.split(" with ", 1)[1]
+                        common_hashes = int(seg.split(" of ", 1)[0].strip())
+                    if " rank " in line:
+                        rank = int(line.split(" rank ", 1)[1].strip())
+                    if " at " in line and " s with " in line:
+                        offset_sec = line.split(" at ", 1)[1].split(" s with ", 1)[0].strip()
+                except Exception:
+                    pass
+
+            inc = MonitorIncident(
+                id=str(uuid.uuid4()),
+                inbox_filename=item["filename"],
+                inbox_path=item["path"],
+                mode=mode,
+                match_filename=match_filename,
+                match_path=match_path,
+                common_hashes=common_hashes,
+                rank=rank,
+                offset_sec=str(offset_sec),
+            )
+
+            # email notify
+            subject = "SampleDetect SAE Monitor: Potential stolen beat detected (prototype)"
+            body = (
+                f"Inbox file: {inc.inbox_filename}\n"
+                f"Inbox path: {inc.inbox_path}\n"
+                f"Mode: {mode}\n\n"
+                f"Best match: {inc.match_filename or 'None'}\n"
+                f"Common hashes: {inc.common_hashes}\n"
+                f"Rank: {inc.rank}\n"
+                f"Offset sec: {inc.offset_sec}\n\n"
+                f"{LEGAL_DISPUTE_TEXT.strip()}\n"
+            )
+            email_res = send_email(subject, body)
+            inc.email_sent = "true" if email_res.get("ok") else "false"
+            inc.email_reason = email_res.get("message_id") or email_res.get("reason")
+
+            db.add(inc)
+            db.commit()
+            incidents_created += 1
+
+        return {"ok": True, "scanned": scanned, "incidents_created": incidents_created, "mode": mode}
+    finally:
+        db.close()
 
 
 @app.get("/monitor/incidents")
-def monitor_incidents(db=Depends(get_db)):
-    rows = db.query(MonitorIncident).order_by(MonitorIncident.created_at.desc()).all()
-    out = []
-    for r in rows:
-        out.append({
-            "id": r.id,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "inbox_filename": r.inbox_filename,
-            "inbox_path": r.inbox_path,
-            "mode": r.mode,
-            "match_filename": r.match_filename,
-            "match_path": r.match_path,
-            "common_hashes": r.common_hashes,
-            "rank": r.rank,
-            "offset_sec": r.offset_sec,
-            "email_sent": r.email_sent,
-            "email_reason": r.email_reason,
-        })
-    return out
-
-
-# =========================
-# Root convenience
-# =========================
-@app.get("/")
-def root():
-    return {"ok": True, "service": "SampleDetect SAE API", "docs": "/docs"}
+def monitor_incidents(limit: int = 200):
+    db = db_session()
+    try:
+        rows = db.query(MonitorIncident).order_by(MonitorIncident.created_at.desc()).limit(limit).all()
+        return [
+            {
+                "id": r.id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "inbox_filename": r.inbox_filename,
+                "inbox_path": r.inbox_path,
+                "mode": r.mode,
+                "match_filename": r.match_filename,
+                "match_path": r.match_path,
+                "common_hashes": r.common_hashes,
+                "rank": r.rank,
+                "offset_sec": r.offset_sec,
+                "email_sent": r.email_sent,
+                "email_reason": r.email_reason,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
