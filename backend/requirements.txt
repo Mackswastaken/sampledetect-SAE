@@ -1,14 +1,24 @@
-﻿joblib==1.4.2
-psutil==6.1.0
-docopt==0.6.2
-fastapi
+﻿fastapi
 uvicorn[standard]
 python-multipart
 sqlalchemy
 psycopg2-binary
 python-dotenv
-rapidfuzz
+
+# SendGrid
 sendgrid
+
+# Blockchain/web3
 web3
+
+# Supabase client
 supabase
-httpx
+
+# audfprint runtime deps (stop missing-module errors on Render)
+docopt==0.6.2
+joblib==1.4.2
+psutil==6.1.0
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.8.4
+pillow==10.4.0
